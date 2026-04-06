@@ -1,0 +1,15 @@
+[Unit]
+Description=traced — execution trace event collector
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/traced
+User=traced
+Group=traced
+RuntimeDirectory=traced
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,66 @@
+#!/usr/bin/python3
+"""trace-emit — send a trace datagram to traced daemon.
+
+Usage:
+    trace-emit --svc NAME --cat CATEGORY --msg MESSAGE [options]
+
+Options:
+    --type TYPE         Event type: emit (default), span, span_start, span_cancel
+    --trace-id ID       Correlation ID
+    --span-id ID        Span identifier
+    --dur-ms MS         Duration in milliseconds (for span type)
+    --fields JSON       Additional fields as JSON object string
+    --socket PATH       Unix socket path (default: /run/traced/traced.sock)
+
+Fire-and-forget: exits 0 always, silent on failure.
+"""
+import argparse
+import json
+import socket
+import sys
+import time
+
+
+def main():
+    p = argparse.ArgumentParser(description="Send trace datagram to traced")
+    p.add_argument("--svc", required=True, help="Service name")
+    p.add_argument("--cat", required=True, help="Category")
+    p.add_argument("--msg", default="", help="Message")
+    p.add_argument("--type", default="emit", help="Event type")
+    p.add_argument("--trace-id", default="", help="Trace correlation ID")
+    p.add_argument("--span-id", default="", help="Span ID")
+    p.add_argument("--dur-ms", type=int, default=0, help="Duration ms")
+    p.add_argument("--fields", default="", help="JSON fields object")
+    p.add_argument("--socket", default="/run/traced/traced.sock",
+                   help="traced socket path")
+    args = p.parse_args()
+
+    ev = {
+        "ts": int(time.time()),
+        "svc": args.svc,
+        "cat": args.cat,
+        "msg": args.msg,
+        "type": args.type,
+    }
+    if args.trace_id:
+        ev["trace_id"] = args.trace_id
+    if args.span_id:
+        ev["span_id"] = args.span_id
+    if args.dur_ms:
+        ev["dur_ms"] = args.dur_ms
+    if args.fields:
+        ev["fields"] = json.loads(args.fields)
+
+    payload = json.dumps(ev, separators=(",", ":")).encode()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+    sock.sendto(payload, args.socket)
+    sock.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

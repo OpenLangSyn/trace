@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""trace-viewer v2 — live terminal trace viewer.
+
+Connects to traced daemon query socket. Three modes:
+  tail   — live event stream (newest last, color-coded by service)
+  status — currently open spans per service
+  errors — error-only event stream
+
+Filters: -s SERVICE, -c CATEGORY, --since MINUTES, --limit N
+Output:  --json for machine-readable (Claude Code), TUI otherwise
+"""
+
+import argparse
+import json
+import os
+import select
+import signal
+import socket
+import sys
+import termios
+import time
+import tty
+from datetime import datetime
+
+QUERY_SOCKET = "/run/traced/traced-query.sock"
+MODES = ["tail", "status", "errors"]
+
+# --- ANSI colors ---
+
+use_color = True
+
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RED    = "\033[31m"
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+BLUE   = "\033[34m"
+MAGENTA= "\033[35m"
+CYAN   = "\033[36m"
+WHITE  = "\033[37m"
+BG_RED = "\033[41m"
+
+SVC_COLORS = [CYAN, GREEN, YELLOW, BLUE, MAGENTA,
+              "\033[96m", "\033[92m", "\033[93m", "\033[94m", "\033[95m"]
+_svc_color_map = {}
+
+def svc_color(name):
+    if not use_color:
+        return ""
+    if name not in _svc_color_map:
+        _svc_color_map[name] = SVC_COLORS[len(_svc_color_map) % len(SVC_COLORS)]
+    return _svc_color_map[name]
+
+def c(code, text):
+    return f"{code}{text}{RESET}" if use_color else text
+
+def visible_len(s):
+    import re
+    return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+def rpad(s, width):
+    return s + " " * max(0, width - visible_len(s))
+
+def lpad(s, width):
+    return " " * max(0, width - visible_len(s)) + s
+
+# --- Terminal raw mode ---
+
+_old_termios = None
+
+def enter_raw():
+    global _old_termios
+    if sys.stdin.isatty():
+        _old_termios = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
+def restore_term():
+    if _old_termios is not None:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _old_termios)
+
+def check_key():
+    if not sys.stdin.isatty():
+        return None
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.read(1)
+    return None
+
+# --- Daemon connection ---
+
+def connect_daemon(socket_path):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(socket_path)
+    return sock
+
+def send_command(sock, mode, args):
+    options = {}
+    if args.since:
+        options["since"] = args.since * 60
+    if args.service:
+        options["service"] = args.service.split(",")[0]
+    if args.category:
+        options["category"] = args.category.split(",")[0]
+    if args.limit:
+        options["limit"] = args.limit
+
+    cmd = mode.upper()
+    if options:
+        cmd += " " + json.dumps(options)
+    cmd += "\n"
+    sock.sendall(cmd.encode())
+
+# --- Event formatting ---
+
+def parse_fields(ev):
+    fields = ev.get("fields", {})
+    if isinstance(fields, str):
+        try:
+            fields = json.loads(fields)
+        except (json.JSONDecodeError, ValueError):
+            fields = {}
+    if not isinstance(fields, dict):
+        fields = {}
+    return fields
+
+def format_fields(fields):
+    if not fields:
+        return ""
+    parts = []
+    for k, v in fields.items():
+        if k == "error":
+            continue
+        kstr = c(DIM, k + "=")
+        parts.append(kstr + str(v))
+    return " ".join(parts)
+
+def print_event(ev):
+    ts_val = ev.get("ts", 0)
+    ts = datetime.fromtimestamp(ts_val).strftime("%H:%M:%S") if ts_val else "??:??:??"
+    svc = ev.get("svc", "")
+    cat = ev.get("cat", "")
+    msg = ev.get("msg", "")
+    dur = ev.get("dur_ms", 0)
+    fields = parse_fields(ev)
+    is_error = cat == "error" or fields.get("error") == "true"
+
+    dur_str = ""
+    if dur and dur > 0:
+        if dur >= 1000:
+            dur_str = c(RED if dur >= 10000 else YELLOW, f" [{dur}ms]")
+        else:
+            dur_str = c(GREEN, f" [{dur}ms]")
+
+    fields_str = format_fields(fields)
+    if fields_str:
+        fields_str = " " + fields_str
+
+    if is_error:
+        line = (f"{c(DIM, ts)}  "
+                f"{c(BG_RED + WHITE + BOLD, f' {svc} ')}  "
+                f"{c(RED, cat):18s}  "
+                f"{c(RED, msg)}{dur_str}{fields_str}")
+    else:
+        line = (f"{c(DIM, ts)}  "
+                f"{c(svc_color(svc) + BOLD, svc):30s}  "
+                f"{c(YELLOW, cat):18s}  "
+                f"{msg}{dur_str}{fields_str}")
+
+    print(line)
+
+# --- Status rendering ---
+
+def render_status(spans):
+    now = time.time()
+    print(c(BOLD, f"Open Spans ({len(spans)})"))
+    print()
+
+    if not spans:
+        print(c(DIM, "  (no open spans)"))
+        return
+
+    hdr = f"{'SERVICE':<20s} {'SCOPE':<14s} {'INTENT':<40s} {'ELAPSED':>10s}"
+    print(c(BOLD + DIM, hdr))
+    print(c(DIM, "\u2500" * visible_len(hdr)))
+
+    for span in sorted(spans, key=lambda s: s.get("ts", 0)):
+        svc = span.get("svc", "")
+        scope = span.get("cat", "")
+        intent = span.get("msg", "")
+        elapsed = int(now - span.get("ts", now))
+
+        if elapsed >= 60:
+            elapsed_str = f"{elapsed // 60}m{elapsed % 60}s"
+        else:
+            elapsed_str = f"{elapsed}s"
+
+        if elapsed >= 60:
+            elapsed_str = c(RED, elapsed_str)
+        elif elapsed >= 10:
+            elapsed_str = c(YELLOW, elapsed_str)
+
+        svc_colored = rpad(c(svc_color(svc) + BOLD, svc), 20)
+        print(f"{svc_colored} {scope:<14s} {intent:<40s} {lpad(elapsed_str, 10)}")
+
+# --- Status bar ---
+
+def print_status_bar(mode):
+    tabs = []
+    for m in MODES:
+        if m == mode:
+            tabs.append(c(BOLD + CYAN, f"[{m.upper()}]"))
+        else:
+            tabs.append(c(DIM, f" {m} "))
+    hint = "  Tab: switch  q: quit"
+    bar = "  ".join(tabs) + c(DIM, hint)
+    print(bar)
+    print()
+
+def clear_screen():
+    print("\033[2J\033[H", end="", flush=True)
+
+# --- Client-side multi-service filter ---
+
+def matches_filters(ev, args):
+    if args.service:
+        svcs = [s.strip() for s in args.service.split(",")]
+        if ev.get("svc", "") not in svcs:
+            return False
+    if args.category:
+        cats = [ct.strip() for ct in args.category.split(",")]
+        if ev.get("cat", "") not in cats:
+            return False
+    return True
+
+# --- JSON output mode ---
+
+def run_json(args):
+    mode = args.mode
+
+    if mode == "status":
+        try:
+            sock = connect_daemon(args.socket)
+            sock.sendall(b"STATUS\n")
+            data = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            sock.close()
+            print(data.decode(), end="")
+        except ConnectionRefusedError:
+            print('{"error":"traced not running"}', file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # TAIL or ERRORS
+    try:
+        sock = connect_daemon(args.socket)
+        send_command(sock, mode, args)
+    except ConnectionRefusedError:
+        print('{"error":"traced not running"}', file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        buf = ""
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            buf += data.decode()
+            while '\n' in buf:
+                line, buf = buf.split('\n', 1)
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "__marker" in ev:
+                    continue
+                if matches_filters(ev, args):
+                    print(line, flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
+
+# --- TUI mode ---
+
+def run_tui(args):
+    mode_idx = MODES.index(args.mode)
+    mode = MODES[mode_idx]
+    sock = None
+
+    enter_raw()
+
+    try:
+        while True:
+            if mode == "status":
+                clear_screen()
+                print_status_bar(mode)
+
+                try:
+                    s = connect_daemon(args.socket)
+                    s.sendall(b"STATUS\n")
+                    data = b""
+                    while True:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                    s.close()
+
+                    resp = json.loads(data.decode())
+                    render_status(resp.get("spans", []))
+                    print()
+                    print(c(DIM, "Refreshes every 1s."))
+                except ConnectionRefusedError:
+                    print(c(RED, "Cannot connect to traced daemon"))
+                    print(c(DIM, f"Socket: {args.socket}"))
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(c(RED, f"Parse error: {e}"))
+
+                # Wait ~1s, checking for keys
+                for _ in range(100):
+                    key = check_key()
+                    if key == '\t':
+                        mode_idx = (mode_idx + 1) % len(MODES)
+                        mode = MODES[mode_idx]
+                        break
+                    if key == 'q':
+                        return
+                    time.sleep(0.01)
+                continue
+
+            # TAIL or ERRORS — streaming mode
+            clear_screen()
+            print_status_bar(mode)
+
+            try:
+                sock = connect_daemon(args.socket)
+                send_command(sock, mode, args)
+                sock.setblocking(False)
+            except ConnectionRefusedError:
+                print(c(RED, "Cannot connect to traced daemon"))
+                print(c(DIM, f"Socket: {args.socket}"))
+                # Wait then retry
+                for _ in range(100):
+                    key = check_key()
+                    if key == '\t':
+                        mode_idx = (mode_idx + 1) % len(MODES)
+                        mode = MODES[mode_idx]
+                        break
+                    if key == 'q':
+                        return
+                    time.sleep(0.01)
+                continue
+
+            buf = ""
+            try:
+                while True:
+                    # Check for keys
+                    key = check_key()
+                    if key == '\t':
+                        mode_idx = (mode_idx + 1) % len(MODES)
+                        mode = MODES[mode_idx]
+                        break
+                    if key == 'q':
+                        return
+
+                    # Read from socket
+                    try:
+                        data = sock.recv(65536)
+                        if not data:
+                            print(c(DIM, "--- connection closed ---"))
+                            time.sleep(1)
+                            break
+                        buf += data.decode()
+
+                        while '\n' in buf:
+                            line, buf = buf.split('\n', 1)
+                            if not line:
+                                continue
+                            try:
+                                ev = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if "__marker" in ev:
+                                print(c(DIM, "--- live ---"))
+                                continue
+                            if matches_filters(ev, args):
+                                print_event(ev)
+                    except BlockingIOError:
+                        pass
+
+                    time.sleep(0.01)
+            finally:
+                sock.close()
+                sock = None
+
+    finally:
+        restore_term()
+        if sock:
+            sock.close()
+        print()
+
+# --- Main ---
+
+def main():
+    global use_color
+
+    parser = argparse.ArgumentParser(
+        prog="trace-viewer",
+        description="trace-viewer v2 — connects to traced daemon",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  trace-viewer                        # tail all events (last 5min)\n"
+               "  trace-viewer tail -s my-service     # tail specific service\n"
+               "  trace-viewer status                  # show open spans\n"
+               "  trace-viewer errors                  # errors only\n"
+               "  trace-viewer --json tail             # machine-readable output\n"
+               "\n"
+               "Interactive:\n"
+               "  Tab        Cycle between tail/status/errors\n"
+               "  q          Quit\n"
+    )
+    parser.add_argument("mode", nargs="?", default="tail", choices=MODES,
+                        help="Viewer mode (default: tail)")
+    parser.add_argument("-s", "--service",
+                        help="Filter by service name(s), comma-separated")
+    parser.add_argument("-c", "--category",
+                        help="Filter by category, comma-separated (tail/errors)")
+    parser.add_argument("--since", type=int, default=5,
+                        help="Start from N minutes ago (default: 5)")
+    parser.add_argument("--limit", type=int, default=200,
+                        help="Max backlog rows (default: 200)")
+    parser.add_argument("--json", action="store_true",
+                        help="Machine-readable JSON output (for Claude Code)")
+    parser.add_argument("--no-color", action="store_true",
+                        help="Disable ANSI colors")
+    parser.add_argument("--socket", default=QUERY_SOCKET,
+                        help=f"Query socket path (default: {QUERY_SOCKET})")
+
+    args = parser.parse_args()
+
+    if args.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        use_color = False
+
+    signal.signal(signal.SIGINT,
+                  lambda *_: (restore_term(), print(), sys.exit(0)))
+
+    if args.json:
+        run_json(args)
+    else:
+        run_tui(args)
+
+if __name__ == "__main__":
+    main()

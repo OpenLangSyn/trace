@@ -1,0 +1,7 @@
+build/
+*.o
+*.a
+*.so
+traced
+test_trace
+test_libtrace
