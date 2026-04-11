@@ -2,6 +2,8 @@
 
 C++17 execution trace client library.
 
+**Author:** Are Bjørby <are.bjorby@langsyn.org>
+
 RAII scoped timers, point events, and structured logging over a unix datagram
 socket. Services emit trace events to a collector daemon — they never touch
 the database directly.
